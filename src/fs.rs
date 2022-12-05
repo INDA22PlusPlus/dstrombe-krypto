@@ -9,6 +9,7 @@ use crypto::digest::Digest;
 use crypto::sha2::Sha384;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use crate::crypto::encrypt_and_hash_file;
 
 // cache time to live, could be set to 0 to disable caching probably
 const TTL: Duration = Duration::from_secs(1);           // 1 second
@@ -54,8 +55,8 @@ pub struct XFileAttr {
 }
 
 pub struct File {
-    xattr: XFileAttr,
-    data: Vec<u8>,
+    pub xattr: XFileAttr,
+    pub data: Vec<u8>,
 }
 
 pub struct Q1FS {
@@ -81,19 +82,37 @@ impl Q1FS {
 impl Filesystem for Q1FS {
     
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        
+        // Directories always contain . and ..
+        reply.add(ino, offset + 1, FileType::Directory, ".");
+        reply.add(ino, offset + 2, FileType::Directory, "..");
         let dir_hash = self.hashes.get(&ino);
         match dir_hash {
             Some(hash) => {
-                let hashes_of_children = api::get_child_hashes(&hash, &self.http_client, &self.server_url);
-                for child_hash in hashes_of_children {
+                let file = self.files.get(hash).unwrap();
+                if file.xattr.attr.kind != FileType::Directory {
+                    reply.error(-1); // todo: replace with "not a directory" error
+                    return;
+                }
+
+                let hashes_of_children = api::get_child_hashes(&hash, &mut self.http_client, &self.server_url);
+                for (i, child_hash) in hashes_of_children.iter().enumerate() {
                     match self.files.get(&child_hash) {
                         Some(file) => {
-                            reply.add(file.xattr.attr.ino, offset, file.xattr.attr.kind, &file.xattr.file_name);
+                            // check if the file is different; if yes we should verify the tree
+                            let fresh_hash = encrypt_and_hash_file(&mut file, &self.crypto_key);
+                            if fresh_hash != child_hash { 
+                                // FIXME verify tree
+                                // this state should be impossible if the server has not tampered with our data
+                            }
+                            else {
+                                reply.add(file.xattr.attr.ino, offset + 2 + i, file.xattr.attr.kind, &file.xattr.file_name);
+                            }
+                            
                         },
                         None => {
-                            let xattr = api::get_xattr(&child_hash, &self.http_client, &self.server_url);
-                            reply.add(xattr.attr.ino, offset, xattr.attr.kind, &xattr.file_name);
+                            // TODO: Should this state really be possible? Consider removing this branch
+                            let xattr = api::get_xattr(&child_hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                            reply.add(xattr.attr.ino, offset + 2 + i, xattr.attr.kind, &xattr.file_name);
                         }
                     }
                 } 
@@ -104,21 +123,6 @@ impl Filesystem for Q1FS {
             }
         }
 
-        if ino != 1 {
-            reply.error(ENOENT);
-            return;
-        }
-
-        let entries = vec![
-            (1, FileType::Directory, "."),
-            (1, FileType::Directory, ".."),
-            (2, FileType::RegularFile, "hello.txt"),
-        ];
-
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            // i + 1 means the index of the next entry
-            reply.add(entry.0, (i + 1) as i64, entry.1, entry.2);
-        }
         reply.ok();
     }
 

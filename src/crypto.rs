@@ -2,14 +2,17 @@ use crypto::{symmetriccipher::{Encryptor, Decryptor}, chacha20::ChaCha20, buffer
 use std::io::Read;
 use crate::fs::File;
 use crypto::sha2::Sha384;
+use crypto::digest::Digest;
 
-pub fn encrypt_and_hash_file(file : &mut File, key : Vec<u8>) -> String {
+pub fn encrypt_and_hash_file(file : &mut File, key : &Vec<u8>) -> String {
     let mut hasher = Sha384::new();
     let mut plaintext_attr = serde_json::to_string(&file.xattr).unwrap();
     let mut plaintext = file.data;
+
+    let mut buf = plaintext_attr.as_bytes().to_vec().clone();
+    let mut ciphertext_attr = encrypt(&mut buf, &key, &generate_nonce());
+    let mut ciphertext = encrypt(&mut plaintext, &key, &generate_nonce());
     
-    let mut ciphertext_attr = encrypt(&mut plaintext_attr, &key, generate_nonce());
-    let mut ciphertext = encrypt(&mut plaintext, &key, generate_nonce());
     hasher.input(&ciphertext_attr);
     hasher.input(&ciphertext);
     let hash = hasher.result_str();
