@@ -1,15 +1,109 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
-use libc::ENOENT;
+use libc::{c_int, ENOENT};
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use crate::api;
+use crypto::digest::Digest;
+use crypto::sha2::Sha384;
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 
-struct Q1FS {
+// cache time to live, could be set to 0 to disable caching probably
+const TTL: Duration = Duration::from_secs(1);           // 1 second
 
+const HELLO_TXT_ATTR: FileAttr = FileAttr {
+    ino: 2,
+    size: 13,
+    blocks: 1,
+    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+    mtime: UNIX_EPOCH,
+    ctime: UNIX_EPOCH,
+    crtime: UNIX_EPOCH,
+    kind: FileType::RegularFile,
+    perm: 0o644,
+    nlink: 1,
+    uid: 501,
+    gid: 20,
+    rdev: 0,
+    flags: 0,
+};
+
+const HELLO_DIR_ATTR: FileAttr = FileAttr {
+    ino: 1,
+    size: 0,
+    blocks: 0,
+    atime: UNIX_EPOCH,                                  // 1970-01-01 00:00:00
+    mtime: UNIX_EPOCH,
+    ctime: UNIX_EPOCH,
+    crtime: UNIX_EPOCH,
+    kind: FileType::Directory,
+    perm: 0o755,
+    nlink: 2,
+    uid: 501,
+    gid: 20,
+    rdev: 0,
+    flags: 0,
+};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct XFileAttr {
+    pub attr: FileAttr,
+    pub file_name: String,
+}
+
+pub struct File {
+    xattr: XFileAttr,
+    data: Vec<u8>,
+}
+
+pub struct Q1FS {
+    // inode -> hash -> file hashmaps
+    hashes : HashMap<u64, String>,
+    files : HashMap<String, File>,
+    http_client: Client,
+    crypto_key: Vec<u8>,
+    server_url: String,
+}
+impl Q1FS {
+    pub fn new() -> Q1FS {
+        Q1FS {
+            hashes: HashMap::new(),
+            files: HashMap::new(),
+            http_client: Client::new(),
+            crypto_key: Vec::new(), //FIXME
+            server_url: "movitzlol.com".to_string(),
+        }
+    }
 }
 
 impl Filesystem for Q1FS {
+    
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        
+        let dir_hash = self.hashes.get(&ino);
+        match dir_hash {
+            Some(hash) => {
+                let hashes_of_children = api::get_child_hashes(&hash, &self.http_client, &self.server_url);
+                for child_hash in hashes_of_children {
+                    match self.files.get(&child_hash) {
+                        Some(file) => {
+                            reply.add(file.xattr.attr.ino, offset, file.xattr.attr.kind, &file.xattr.file_name);
+                        },
+                        None => {
+                            let xattr = api::get_xattr(&child_hash, &self.http_client, &self.server_url);
+                            reply.add(xattr.attr.ino, offset, xattr.attr.kind, &xattr.file_name);
+                        }
+                    }
+                } 
+            }
+            None => {
+                // FIXME recursively check the parent directory for the directory
+                reply.error(ENOENT);
+            }
+        }
+
         if ino != 1 {
             reply.error(ENOENT);
             return;
@@ -27,8 +121,26 @@ impl Filesystem for Q1FS {
         }
         reply.ok();
     }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        let hash = self.hashes.get(&ino);
+        match hash {
+            Some(hash) => {
+                // TODO make this function return an option/result and handle it here
+                let xattr = api::get_xattr(&hash.to_string(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                reply.attr(&TTL, &xattr.attr);
+            }
+            None => {
+                // FIXME recursively check the parent directory for the file
+                reply.error(ENOENT);
+            }
+        }
+    }
+    
+    fn init(&mut self, _req: &Request) -> Result<(), c_int> { 
+        Ok(())
+    }
     /*
-    fn init(&mut self, _req: &Request) -> Result<(), c_int> { ... }
     fn destroy(&mut self, _req: &Request) { ... }
     fn lookup(
         &mut self, 
