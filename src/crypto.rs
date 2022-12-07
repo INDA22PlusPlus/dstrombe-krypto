@@ -7,7 +7,7 @@ use crypto::digest::Digest;
 pub fn encrypt_and_hash_file(file : &mut File, key : &Vec<u8>) -> String {
     let mut hasher = Sha384::new();
     let mut plaintext_attr = serde_json::to_string(&file.xattr).unwrap();
-    let mut plaintext = file.data;
+    let mut plaintext = file.data.clone();
 
     let mut buf = plaintext_attr.as_bytes().to_vec().clone();
     let mut ciphertext_attr = encrypt(&mut buf, &key, &generate_nonce());
@@ -26,7 +26,7 @@ pub fn verify_merkle_hashes() {
 
 pub fn encrypt(data: &Vec<u8>, key: &Vec<u8>, nonce : &Vec<u8>) -> Vec<u8> {
     
-    let mut encryptor = Box::new(ChaCha20::new(&key, &nonce)) as Box<dyn Encryptor>;
+    let mut encryptor = Box::new(ChaCha20::new_xchacha20(&key, &nonce)) as Box<dyn Encryptor>;
     let mut plaintext = RefReadBuffer::new(&data);
     let mut buf = Vec::new();
     let mut encrypted = RefWriteBuffer::new(&mut buf);
@@ -36,7 +36,7 @@ pub fn encrypt(data: &Vec<u8>, key: &Vec<u8>, nonce : &Vec<u8>) -> Vec<u8> {
 
 pub fn decrypt(encrypted: &Vec<u8>, key: &Vec<u8>, nonce: &Vec<u8>) -> Vec<u8> {
     
-    let mut decryptor = Box::new(ChaCha20::new(&key, &nonce)) as Box<dyn Decryptor>;
+    let mut decryptor = Box::new(ChaCha20::new_xchacha20(&key, &nonce)) as Box<dyn Decryptor>;
     let mut ciphertext = RefReadBuffer::new(&encrypted);
     let mut buf = Vec::new();
     let mut decrypted = RefWriteBuffer::new(&mut buf);
@@ -44,6 +44,8 @@ pub fn decrypt(encrypted: &Vec<u8>, key: &Vec<u8>, nonce: &Vec<u8>) -> Vec<u8> {
     decrypted.take_remaining().to_vec()
 }
 
+// we use xchacha20 so as to use a 192 bit nonce
+// otherwise our nonces may collide after sufficient file uploads
 pub fn generate_nonce() -> Vec<u8> {
     let mut nonce = vec![0u8; 24]; // FIXME lol
     nonce
