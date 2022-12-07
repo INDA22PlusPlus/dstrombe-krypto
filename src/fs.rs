@@ -3,17 +3,22 @@ use std::env;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use libc::{c_int, ENOENT, ENOSYS};
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyOpen, ReplyWrite, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyOpen, ReplyWrite, ReplyData, ReplyCreate, ReplyEntry, ReplyAttr, ReplyDirectory};
 use crate::api;
 use crypto::digest::Digest;
 use crypto::sha2::Sha384;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use crate::crypto::encrypt_and_hash_file;
+use crate::crypto::{hash, encrypt_and_hash_file};
+use std::path::PathBuf;
 
 // cache time to live, could be set to 0 to disable caching probably
 const TTL: Duration = Duration::from_secs(1);           // 1 second
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Dir {
+    pub files : HashMap<u64, String>, // inode -> filename
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct XFileAttr {
@@ -28,20 +33,29 @@ pub struct File {
 }
 
 pub struct Q1FS {
-    // inode -> hash -> file hashmaps
+    // fs metadata
+    top_ino : u64, // tracks the highest inode number
+
+    // name -> inode -> hash -> file hashmaps
+    // effectively allowing us to retreive a file by name, inode, or hash
     hashes : HashMap<u64, String>,
     files : HashMap<String, File>,
+    inodes : HashMap<String, u64>,
+
     http_client: Client,
     crypto_key: Vec<u8>,
     server_url: String,
 }
+
 impl Q1FS {
     pub fn new() -> Q1FS {
         Q1FS {
+            top_ino : 1, // 0 is reserved for root
             hashes: HashMap::new(),
             files: HashMap::new(),
+            inodes: HashMap::new(),
             http_client: Client::new(),
-            crypto_key: Vec::new(), //FIXME
+            crypto_key: hash(&"hunter2".as_bytes()), //FIXME
             server_url: "localhost:8000".to_string(),
         }
     }
@@ -91,6 +105,7 @@ impl Filesystem for Q1FS {
                                 data: data,
                             };
 
+                            self.inodes.insert(file.xattr.file_name.clone(), ino);
                             self.hashes.insert(ino, child_hash.clone());
                             self.files.insert(child_hash.clone(), file);
 
@@ -114,19 +129,20 @@ impl Filesystem for Q1FS {
         match hash {
             Some(hash) => {
                 // TODO make this function return an option/result and handle it here
-                let xattr = api::get_xattr(&hash.to_string(), &mut self.http_client, &self.crypto_key, &self.server_url);
-                reply.attr(&TTL, &xattr.attr);
+                //let xattr = api::get_xattr(&hash.to_string(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                let xattr = &self.files.get(hash).unwrap().xattr;
+                reply.attr(&TTL, &xattr.attr.clone());
             }
             None => {
-                // FIXME recursively check the parent directory for the file
+                // impossible state
+                
                 reply.error(ENOENT);
             }
         }
     }
     
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: ReplyOpen) {
-        // check if the file exists either on the server or locally,
-        // if it exists we should check its permissions
+        // should check flags + perms
 
         let hash = self.hashes.get(&_ino);
         match hash {
@@ -134,19 +150,162 @@ impl Filesystem for Q1FS {
                 reply.opened(0, 0); // all opened instances of this file will share fh 0
             }
             None => {
-                // FIXME recursively check the parent directory for the file
                 reply.error(ENOENT);
             }
         }
 
     }
 
+    fn create(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
+        // should check flags + perms
+        // FIXME update parent hashes recursively.
+        let mut parent_hash = self.hashes.get(&_parent).clone();
+
+        match parent_hash {
+            Some(parent_hash) => {
+
+                let file = File {
+                    xattr: XFileAttr {
+                        attr: FileAttr {
+                            ino: self.top_ino + 1, // FIXME
+                            size: 0,
+                            blocks: 0,
+                            atime: SystemTime::now(),
+                            mtime: SystemTime::now(),
+                            ctime: SystemTime::now(),
+                            crtime: SystemTime::now(),
+                            kind: FileType::RegularFile,
+                            perm: 0o777,
+                            nlink: 0,
+                            uid: 0,
+                            gid: 0,
+                            rdev: 0,
+                            flags: 0,
+                        },
+                        file_name: _name.to_str().unwrap().to_string(),
+                    },
+                    data: Vec::new(),
+                };
+
+                let hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
+
+                api::create(&file.xattr, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                
+                self.inodes.insert(file.xattr.file_name.clone(), self.top_ino + 1);
+                self.hashes.insert(self.top_ino + 1, hash.clone());
+                self.files.insert(hash.clone(), file.clone());
+                self.top_ino += 1;
+                
+                reply.created(&TTL, &file.xattr.attr, 0, 0, 0);
+            }
+            None => {
+                reply.error(ENOENT);
+            }
+        }
+    }
+
+    fn lookup(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEntry) {
+        let ino = self.inodes.get(_name.to_str().unwrap());
+        match ino {
+            Some(ino) => {
+                let hash = self.hashes.get(ino).unwrap();
+                let xattr = self.files.get(hash).unwrap().xattr.clone();
+                reply.entry(&TTL, &xattr.attr, 0);
+            }
+            None => {
+                let parent_hash = self.hashes.get(&_parent);
+                let child_hashes = api::get_child_hashes(parent_hash.unwrap(), &mut self.http_client, &self.server_url);
+                for hash in child_hashes {
+                    let xattr = api::get_xattr(&hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                    if xattr.file_name == _name.to_str().unwrap() {
+                        reply.entry(&TTL, &xattr.attr, 0);
+                        return;
+                    }
+                }
+                reply.error(ENOENT);
+                return;
+                /*
+                // recursively check the parent directory for the file
+                
+                // truncate the last item in the path
+                let mut pathbuf = PathBuf::from(_name);
+                while pathbuf.pop() {
+                    let parent_ino = self.inodes.get(pathbuf.to_str().unwrap());
+                    match parent_ino {
+                        Some(ino) => {
+                            
+                        }
+                        None => {
+
+                        }
+                    }
+                }
+                */
+            }
+        }
+    }
+
     fn read(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _size: u32, reply: ReplyData) {
-        reply.error(ENOSYS);
+        // check file permissions (TODO)
+
+        let hash = self.hashes.get(&_ino);
+        match hash {
+            Some(hash) => {
+                let file = self.files.get(hash).unwrap();
+                if _offset > file.data.len() as i64 {
+                    reply.error(0);
+                    return;
+                }
+                if _offset + _size as i64 > file.data.len() as i64 {
+                    reply.data(&file.data[_offset as usize..]);
+                }
+                else {
+                    reply.data(&file.data[_offset as usize.._offset as usize + _size as usize]);
+                }
+            }
+            None => {
+                reply.error(ENOENT);
+            }
+        }
     }
 
     fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
-        reply.error(ENOSYS);
+        // check file permissions (TODO)
+        let hash = self.hashes.get(&_ino);
+        match hash {
+            Some(hash) => {
+                let hash = hash.clone();
+                let mut file = self.files.get_mut(&hash.clone()).unwrap().clone();
+                if _offset > file.data.len() as i64 {
+                    reply.error(0);
+                    return;
+                }
+                if _offset + _data.len() as i64 > file.data.len() as i64 {
+                    // extend the file
+                    file.data.resize(_offset as usize + _data.len(), 0);
+                    let flen = file.data.len();
+                    file.data[_offset as usize..].copy_from_slice(&_data);
+
+                    // update the file's xattr
+                    file.xattr.attr.size = flen as u64;
+                    file.xattr.attr.blocks = flen as u64 / 4096; // bogus, idk how blocks work
+
+                    let new_hash = api::set_xattr(&hash, &mut file, &mut self.http_client, &self.crypto_key, &self.server_url);
+                    self.hashes.remove(&_ino);
+                    self.hashes.insert(_ino, new_hash.clone());
+                    self.files.insert(new_hash, file);
+                    self.files.remove(&hash);
+                    
+                }
+                else {
+                    file.data[_offset as usize.._offset as usize + _data.len()].copy_from_slice(_data);
+                }
+                
+            }
+            None => {
+                reply.error(ENOENT);
+            }
+        }
     }
 
     fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _atime: Option<SystemTime>, _mtime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
@@ -220,15 +379,53 @@ impl Filesystem for Q1FS {
             }
         }
     }
-    fn mknod(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, _rdev: u32, reply: ReplyEntry) {
-        reply.error(ENOSYS);
-    }
 
     fn mkdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, reply: ReplyEntry) {
-        reply.error(ENOSYS);
+        let parent = self.hashes.get(&_parent);
+        match parent {
+            Some(hash) => {
+                
+            }
+            None => {
+                reply.error(ENOENT);
+            }
+        }
     }
 
     fn init(&mut self, _req: &Request) -> Result<(), c_int> { 
+        // check if root dir exists
+        // FIXME establish implementation
+        
+        let has_root_dir = false;
+        if !has_root_dir {
+            // create root dir
+            let root_dir = File {
+                xattr: XFileAttr {
+                    attr: FileAttr {
+                        ino: 0,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::now(),
+                        mtime: SystemTime::now(),
+                        ctime: SystemTime::now(),
+                        crtime: SystemTime::now(),
+                        kind: FileType::Directory,
+                        perm: 0o755,
+                        nlink: 0,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        flags: 0,
+                    },
+                    file_name: "root".to_string(),
+                },
+                data: Vec::new(),
+            };
+            api::mkdir(&root_dir.xattr, None, &mut self.http_client, &self.crypto_key, &self.server_url);
+            self.inodes.insert("".to_string(), 0);
+            self.hashes.insert(0, "".to_string()); // FIXME 
+        }
+
         Ok(())
     }
 }

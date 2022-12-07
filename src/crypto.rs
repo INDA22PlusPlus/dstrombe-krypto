@@ -44,6 +44,15 @@ pub fn decrypt(encrypted: &Vec<u8>, key: &Vec<u8>, nonce: &Vec<u8>) -> Vec<u8> {
     decrypted.take_remaining().to_vec()
 }
 
+pub fn hash(data: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha384::new();
+    hasher.input(&data);
+    let mut hash = Vec::new();
+    hasher.result(&mut hash);
+    hash
+}
+
+
 // we use xchacha20 so as to use a 192 bit nonce
 // otherwise our nonces may collide after sufficient file uploads
 pub fn generate_nonce() -> Vec<u8> {

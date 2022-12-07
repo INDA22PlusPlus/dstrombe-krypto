@@ -49,16 +49,20 @@ pub fn get_nonce(hash: &String, client : &Client, server : &String) -> Vec<u8> {
     body
 }
 
-pub fn mkdir(xfileattr : XFileAttr, parent_hash : String, client : &mut Client, key : &Vec<u8>, server : &String) {
-    // Create a directory on the server
-    let url = format!("{}/api/mkdir?parent={}", server, parent_hash);
+pub fn mkdir(xfileattr : &XFileAttr, parent_hash : Option<String>, client : &mut Client, key : &Vec<u8>, server : &String) {
+    
+    let query = match parent_hash {
+        Some(hash) => format!("?parent={}", hash),
+        None => String::new()
+    };
+    let url = format!("{}/api/mkdir{}", server, query);
     let encrypted = encrypt(&serde_json::to_vec(&xfileattr).unwrap(), &key, &vec![0; 24]); // FIXME nonce
     let mut response = client.post(&url).body(encrypted).send().unwrap();
     let mut body = Vec::new();
     response.read_to_end(&mut body).unwrap();
 }
 
-pub fn create(xfileattr : XFileAttr, parent_hash : String, client : &mut Client, key : &Vec<u8>, server : &String) {
+pub fn create(xfileattr : &XFileAttr, parent_hash : &String, client : &mut Client, key : &Vec<u8>, server : &String) {
     // Create a file
     let url = format!("{}/api/mkdir?parent={}", server, parent_hash);
     let encrypted = encrypt(&serde_json::to_vec(&xfileattr).unwrap(), &key, &vec![0; 24]); // FIXME nonce
