@@ -8,7 +8,7 @@ use std::env;
 fn main() {
     println!("Attempting mount");
     let mountpoint = env::args_os().nth(1).unwrap();
-    let options = ["-o", "ro", "-o", "fsname=hello"]
+    let options = ["-o", "rw", "-o", "fsname=hello"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();

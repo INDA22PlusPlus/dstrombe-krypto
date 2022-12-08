@@ -50,13 +50,13 @@ pub struct Q1FS {
 impl Q1FS {
     pub fn new() -> Q1FS {
         Q1FS {
-            top_ino : 1, // 0 is reserved for root
+            top_ino : 1, // 1 is reserved for root
             hashes: HashMap::new(),
             files: HashMap::new(),
             inodes: HashMap::new(),
             http_client: Client::new(),
-            crypto_key: hash(&"hunter2".as_bytes()), //FIXME
-            server_url: "localhost:8000".to_string(),
+            crypto_key: hash(&"hunter2".as_bytes())[..32].to_vec(), //FIXME
+            server_url: "http://127.0.0.1:8000/api".to_string(),
         }
     }
 }
@@ -64,6 +64,7 @@ impl Q1FS {
 impl Filesystem for Q1FS {
     
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        println!("readdir: ino: {}, offset: {}", ino, offset);
         // Directories always contain . and ..
         reply.add(ino, offset + 1, FileType::Directory, ".");
         reply.add(ino, offset + 2, FileType::Directory, "..");
@@ -130,6 +131,7 @@ impl Filesystem for Q1FS {
             Some(hash) => {
                 // TODO make this function return an option/result and handle it here
                 //let xattr = api::get_xattr(&hash.to_string(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                println!("getattr: {} {:?}", ino, hash);
                 let xattr = &self.files.get(hash).unwrap().xattr;
                 reply.attr(&TTL, &xattr.attr.clone());
             }
@@ -142,6 +144,7 @@ impl Filesystem for Q1FS {
     }
     
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: ReplyOpen) {
+        println!("open: {}", _ino);
         // should check flags + perms
 
         let hash = self.hashes.get(&_ino);
@@ -157,6 +160,8 @@ impl Filesystem for Q1FS {
     }
 
     fn create(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
+        println!("create: {} {:?}", _parent, _name);
+
         // should check flags + perms
         // FIXME update parent hashes recursively.
         let mut parent_hash = self.hashes.get(&_parent).clone();
@@ -205,6 +210,7 @@ impl Filesystem for Q1FS {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEntry) {
+        println!("lookup: {} {}", _parent, _name.to_str().unwrap());
         let ino = self.inodes.get(_name.to_str().unwrap());
         match ino {
             Some(ino) => {
@@ -213,7 +219,9 @@ impl Filesystem for Q1FS {
                 reply.entry(&TTL, &xattr.attr, 0);
             }
             None => {
+                println!("lookup: downloading xattr for {}", _name.to_str().unwrap());
                 let parent_hash = self.hashes.get(&_parent);
+                println!("parent: {:?}", _parent);
                 let child_hashes = api::get_child_hashes(parent_hash.unwrap(), &mut self.http_client, &self.server_url);
                 for hash in child_hashes {
                     let xattr = api::get_xattr(&hash, &mut self.http_client, &self.crypto_key, &self.server_url);
@@ -222,8 +230,46 @@ impl Filesystem for Q1FS {
                         return;
                     }
                 }
-                reply.error(ENOENT);
-                return;
+                println!("lookup: not found");
+                // create file
+                let parent_hash = self.hashes.get(&_parent);
+                match parent_hash {
+                    Some(parent_hash) => {
+                        let file = File {
+                            xattr: XFileAttr {
+                                attr: FileAttr {
+                                    ino: self.top_ino + 1, // FIXME
+                                    size: 0,
+                                    blocks: 0,
+                                    atime: SystemTime::now(),
+                                    mtime: SystemTime::now(),
+                                    ctime: SystemTime::now(),
+                                    crtime: SystemTime::now(),
+                                    kind: FileType::RegularFile,
+                                    perm: 0o777,
+                                    nlink: 0,
+                                    uid: 0,
+                                    gid: 0,
+                                    rdev: 0,
+                                    flags: 0,
+                                },
+                                file_name: _name.to_str().unwrap().to_string(),
+                            },
+                            data: Vec::new(),
+                        };
+
+                        let hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
+                        api::create(&file.xattr, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                        self.inodes.insert(file.xattr.file_name.clone(), self.top_ino + 1);
+                        self.hashes.insert(self.top_ino + 1, hash.clone());
+                        self.files.insert(hash.clone(), file.clone());
+                        reply.entry(&TTL, &file.xattr.attr, 0);
+                    }
+                    None => {
+                        reply.error(ENOENT);
+                    }
+                }
+
                 /*
                 // recursively check the parent directory for the file
                 
@@ -246,6 +292,7 @@ impl Filesystem for Q1FS {
     }
 
     fn read(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _size: u32, reply: ReplyData) {
+        println!("read: {} {} {} {}", _ino, _fh, _offset, _size);
         // check file permissions (TODO)
 
         let hash = self.hashes.get(&_ino);
@@ -270,6 +317,7 @@ impl Filesystem for Q1FS {
     }
 
     fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
+        println!("write: {} {} {} {:?}", _ino, _fh, _offset, _data);
         // check file permissions (TODO)
         let hash = self.hashes.get(&_ino);
         match hash {
@@ -300,6 +348,7 @@ impl Filesystem for Q1FS {
                 else {
                     file.data[_offset as usize.._offset as usize + _data.len()].copy_from_slice(_data);
                 }
+                reply.written(_data.len() as u32);
                 
             }
             None => {
@@ -309,6 +358,7 @@ impl Filesystem for Q1FS {
     }
 
     fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _atime: Option<SystemTime>, _mtime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+        println!("setattr: {} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", _ino, _mode, _uid, _gid, _size, _atime, _mtime, _fh, _crtime, _chgtime, _bkuptime, _flags);
         let hash = self.hashes.get(&_ino);
         match hash {
             Some(hash) => {
@@ -366,9 +416,11 @@ impl Filesystem for Q1FS {
                     
                     reply.attr(&TTL, &attr);
                 }
+                //println!("old hash: {} new hash: {} ino: {}", hash, new_hash, _ino);
+                self.files.remove(hash);
                 self.files.insert(new_hash.clone(), file_clone.unwrap());
                 
-                self.files.remove(hash);               
+                               
                 self.hashes.insert(_ino, new_hash.clone());
                 
                 
@@ -381,6 +433,7 @@ impl Filesystem for Q1FS {
     }
 
     fn mkdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, reply: ReplyEntry) {
+        println!("mkdir: {} {:?} {}", _parent, _name, _mode);
         let parent = self.hashes.get(&_parent);
         match parent {
             Some(hash) => {
@@ -393,6 +446,7 @@ impl Filesystem for Q1FS {
     }
 
     fn init(&mut self, _req: &Request) -> Result<(), c_int> { 
+        println!("init");
         // check if root dir exists
         // FIXME establish implementation
         
@@ -402,7 +456,7 @@ impl Filesystem for Q1FS {
             let root_dir = File {
                 xattr: XFileAttr {
                     attr: FileAttr {
-                        ino: 0,
+                        ino: 1,
                         size: 0,
                         blocks: 0,
                         atime: SystemTime::now(),
@@ -410,7 +464,7 @@ impl Filesystem for Q1FS {
                         ctime: SystemTime::now(),
                         crtime: SystemTime::now(),
                         kind: FileType::Directory,
-                        perm: 0o755,
+                        perm: 0o777,
                         nlink: 0,
                         uid: 0,
                         gid: 0,
@@ -421,9 +475,10 @@ impl Filesystem for Q1FS {
                 },
                 data: Vec::new(),
             };
-            api::mkdir(&root_dir.xattr, None, &mut self.http_client, &self.crypto_key, &self.server_url);
-            self.inodes.insert("".to_string(), 0);
-            self.hashes.insert(0, "".to_string()); // FIXME 
+            let top_hash = api::new_root(&root_dir.xattr, &mut self.http_client, &self.crypto_key, &self.server_url);
+            self.inodes.insert("".to_string(), 1);
+            self.hashes.insert(1, top_hash.clone()); // FIXME
+            self.files.insert(top_hash, root_dir);
         }
 
         Ok(())
