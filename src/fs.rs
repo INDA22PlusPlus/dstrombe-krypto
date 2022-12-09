@@ -5,25 +5,23 @@ use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use libc::{c_int, ENOENT, ENOSYS};
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyOpen, ReplyWrite, ReplyData, ReplyCreate, ReplyEntry, ReplyAttr, ReplyDirectory};
 use crate::api;
+use crate::api::Node;
 use crypto::digest::Digest;
 use crypto::sha2::Sha384;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use crate::crypto::{hash, encrypt_and_hash_file};
+use crate::crypto::{hash, encrypt_and_hash_file, hash_of_dir};
 use std::path::PathBuf;
 
 // cache time to live, could be set to 0 to disable caching probably
 const TTL: Duration = Duration::from_secs(1);           // 1 second
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Dir {
-    pub files : HashMap<u64, String>, // inode -> filename
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct XFileAttr {
     pub attr: FileAttr,
     pub file_name: String,
+    pub parent_ino : u64,
 }
 
 #[derive(Clone)]
@@ -41,7 +39,7 @@ pub struct Q1FS {
     hashes : HashMap<u64, String>,
     files : HashMap<String, File>,
     inodes : HashMap<String, u64>,
-
+    
     http_client: Client,
     crypto_key: Vec<u8>,
     server_url: String,
@@ -51,33 +49,75 @@ impl Q1FS {
     pub fn new() -> Q1FS {
         Q1FS {
             top_ino : 1, // 1 is reserved for root
+            
             hashes: HashMap::new(),
             files: HashMap::new(),
             inodes: HashMap::new(),
+
             http_client: Client::new(),
             crypto_key: hash(&"hunter2".as_bytes())[..32].to_vec(), //FIXME
             server_url: "http://127.0.0.1:8000/api".to_string(),
+        }
+    }
+
+    fn update_parent_hashes(&mut self, child : &File) {
+        let mut curr_file : File = child.clone();
+        loop {
+            let parent_hash = self.hashes.get(&curr_file.xattr.parent_ino);
+            match parent_hash {
+                Some(hash) => {
+                    let hash = hash.clone();
+                    let parent_file = self.files.get(&hash.clone()).unwrap().clone();
+                    let children = api::get_child_hashes(&hash.clone(), &self.http_client, &self.server_url);
+                    let new_hash = hash_of_dir(&parent_file.xattr, &children, &self.crypto_key);
+                    
+                    // update ino -> hash map
+                    self.hashes.remove(&curr_file.xattr.parent_ino);
+                    self.hashes.insert(curr_file.xattr.parent_ino, new_hash.clone());
+                    
+                    // update hash -> file map
+                    self.files.remove(&hash.clone());
+                    self.files.insert(new_hash.clone(), parent_file.clone());
+                    curr_file = parent_file;
+                },
+                None => {
+                    panic!("Parent hash not found");
+                },
+            }
+            if curr_file.xattr.parent_ino == 1 {
+                break;
+            }
         }
     }
 }
 
 impl Filesystem for Q1FS {
     
+
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         println!("readdir: ino: {}, offset: {}", ino, offset);
-        // Directories always contain . and ..
-        reply.add(ino, offset + 1, FileType::Directory, ".");
-        reply.add(ino, offset + 2, FileType::Directory, "..");
+        // Directories always contain . and .. offset magic is unclear, but saw it in the example
+        
+        if offset <= 1 {
+            if offset == 0 {
+                reply.add(ino, 1, FileType::Directory, ".");
+            }
+            reply.add(ino, 2, FileType::Directory, "..");
+        }
+        
         let dir_hash = self.hashes.get(&ino);
         match dir_hash {
             Some(hash) => {
                 let file = self.files.get(hash).unwrap();
+                let saved_file = file.clone();
                 if file.xattr.attr.kind != FileType::Directory {
+                    println!("readdir: not a directory");
                     reply.error(-1); // todo: replace with "not a directory" error
                     return;
                 }
 
                 let hashes_of_children = api::get_child_hashes(&hash, &mut self.http_client, &self.server_url);
+                println!("readdir: hashes of children: {:?}", hashes_of_children);
                 for (i, child_hash) in hashes_of_children.iter().enumerate() {
                     match self.files.get(child_hash) {
                         Some(file) => {
@@ -85,42 +125,69 @@ impl Filesystem for Q1FS {
                             // check if the file is different; if yes we should verify the tree
                             let fresh_hash = encrypt_and_hash_file(&mut f_clone, &self.crypto_key);
                             if fresh_hash != child_hash.clone() { 
+                                println!("hash mismatch, verifying tree");
                                 // FIXME verify tree
                                 // this state should be impossible if the server has not tampered with our data
                             }
-                            else {
-                                reply.add(file.xattr.attr.ino, offset + 2 + i as i64, file.xattr.attr.kind, &file.xattr.file_name);
-
+                            {
+                                println!("readdir: adding child: {}", file.xattr.file_name);
+                                if i as i64 + 2 >= offset {
+                                    println!("readdir: added child: {}", file.xattr.file_name);
+                                    reply.add(file.xattr.attr.ino, i as i64 + 2, file.xattr.attr.kind, &file.xattr.file_name);
+                                }
+                                
                             }
                             
                         },
                         None => {
+                            println!("readdir: child not found in files");
                             // TODO: Should this state really be possible? Consider removing this branch
-                            let xattr = api::get_xattr(&child_hash, &mut self.http_client, &self.crypto_key, &self.server_url);
-                            let data = api::get_data(&child_hash, &mut self.http_client, &self.crypto_key, &self.server_url);
-                            let ino = xattr.attr.ino;
-                            reply.add(xattr.attr.ino, offset + 2 + i as i64, xattr.attr.kind, &xattr.file_name);
-                            
-                            let file = File {
-                                xattr: xattr,
-                                data: data,
-                            };
+                            if i as i64 + 2 >= offset {
+                                println!("readdir: added child: {}", child_hash);
+                                let xattr = api::get_xattr(&child_hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                                let data = api::get_data(&child_hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                                let ino = xattr.attr.ino;
+                                
+                                reply.add(xattr.attr.ino, i as i64 + 2, xattr.attr.kind, &xattr.file_name);
+                                
+                                let file = File {
+                                    xattr: xattr,
+                                    data: data,
+                                };
 
-                            self.inodes.insert(file.xattr.file_name.clone(), ino);
-                            self.hashes.insert(ino, child_hash.clone());
-                            self.files.insert(child_hash.clone(), file);
+                                self.inodes.insert(file.xattr.file_name.clone(), ino);
+                                self.hashes.insert(ino, child_hash.clone());
+                                
+                                self.files.insert(child_hash.clone(), file);
 
-                            
+                            }
+                                                        
                         }
+                        
                     }
+
                 }
                 reply.ok();
+                // update hash of dir
+                                
             }
             None => {
+                println!("readdir: dir not found");
                 // FIXME recursively check the parent directory for the directory
                 reply.error(ENOENT);
+                return;
             }
         }
+
+        // no time hack
+        let dir_hash = self.hashes.get(&ino).unwrap().clone();
+        let dir_file = self.files.get(&dir_hash.clone()).unwrap().clone();
+        let hashes_of_children = api::get_child_hashes(&dir_hash, &mut self.http_client, &self.server_url);
+        let new_hash = hash_of_dir(&dir_file.xattr, &hashes_of_children, &self.crypto_key);
+        self.hashes.remove(&ino);
+        self.hashes.insert(ino, new_hash.clone());
+        self.files.remove(&dir_hash.clone());
+        self.files.insert(new_hash.clone(), dir_file.clone());
 
         
     }
@@ -188,19 +255,20 @@ impl Filesystem for Q1FS {
                             flags: 0,
                         },
                         file_name: _name.to_str().unwrap().to_string(),
+                        parent_ino: _parent,
                     },
                     data: Vec::new(),
                 };
 
                 let hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
 
-                api::create(&file.xattr, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                api::create(&file, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
                 
                 self.inodes.insert(file.xattr.file_name.clone(), self.top_ino + 1);
                 self.hashes.insert(self.top_ino + 1, hash.clone());
                 self.files.insert(hash.clone(), file.clone());
                 self.top_ino += 1;
-                
+                self.update_parent_hashes(&file);
                 reply.created(&TTL, &file.xattr.attr, 0, 0, 0);
             }
             None => {
@@ -254,15 +322,17 @@ impl Filesystem for Q1FS {
                                     flags: 0,
                                 },
                                 file_name: _name.to_str().unwrap().to_string(),
+                                parent_ino: _parent,
                             },
                             data: Vec::new(),
                         };
 
                         let hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
-                        api::create(&file.xattr, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
+                        api::create(&file, &parent_hash.clone(), &mut self.http_client, &self.crypto_key, &self.server_url);
                         self.inodes.insert(file.xattr.file_name.clone(), self.top_ino + 1);
                         self.hashes.insert(self.top_ino + 1, hash.clone());
                         self.files.insert(hash.clone(), file.clone());
+                        self.update_parent_hashes(&file);
                         reply.entry(&TTL, &file.xattr.attr, 0);
                     }
                     None => {
@@ -331,23 +401,27 @@ impl Filesystem for Q1FS {
                 if _offset + _data.len() as i64 > file.data.len() as i64 {
                     // extend the file
                     file.data.resize(_offset as usize + _data.len(), 0);
-                    let flen = file.data.len();
-                    file.data[_offset as usize..].copy_from_slice(&_data);
-
-                    // update the file's xattr
-                    file.xattr.attr.size = flen as u64;
-                    file.xattr.attr.blocks = flen as u64 / 4096; // bogus, idk how blocks work
-
-                    let new_hash = api::set_xattr(&hash, &mut file, &mut self.http_client, &self.crypto_key, &self.server_url);
-                    self.hashes.remove(&_ino);
-                    self.hashes.insert(_ino, new_hash.clone());
-                    self.files.insert(new_hash, file);
-                    self.files.remove(&hash);
                     
+                    file.data[_offset as usize..].copy_from_slice(&_data);
+                                        
                 }
                 else {
                     file.data[_offset as usize.._offset as usize + _data.len()].copy_from_slice(_data);
                 }
+                let flen = file.data.len();
+                
+                // update the file's xattr
+                file.xattr.attr.size = flen as u64;
+                file.xattr.attr.blocks = flen as u64 / 4096; // bogus, idk how blocks work
+                
+                api::delete(&hash, &mut self.http_client, &self.server_url);
+                api::create(&file, &hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                let new_hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
+                self.hashes.remove(&_ino);
+                self.hashes.insert(_ino, new_hash.clone());
+                self.files.insert(new_hash, file.clone());
+                self.files.remove(&hash);
+                self.update_parent_hashes(&file);
                 reply.written(_data.len() as u32);
                 
             }
@@ -407,10 +481,16 @@ impl Filesystem for Q1FS {
                     let xattr = XFileAttr {
                         attr: attr,
                         file_name: file.xattr.file_name.clone(),
+                        parent_ino: file.xattr.parent_ino.clone(),
                     };
                     // TODO hack wasn't actually needed, refactor
                     (*file).xattr = xattr;
-                    new_hash = api::set_xattr(&hash.to_string(), file, &mut self.http_client, &self.crypto_key, &self.server_url);
+                    // delete the old file
+                    api::delete(&hash, &mut self.http_client, &self.server_url);
+                    // create the new file
+                    api::create(&file, &hash, &mut self.http_client, &self.crypto_key, &self.server_url);
+                    new_hash = encrypt_and_hash_file(&mut file.clone(), &self.crypto_key);
+
                     file_clone = Some(file.clone());
                     
                     
@@ -418,10 +498,12 @@ impl Filesystem for Q1FS {
                 }
                 //println!("old hash: {} new hash: {} ino: {}", hash, new_hash, _ino);
                 self.files.remove(hash);
-                self.files.insert(new_hash.clone(), file_clone.unwrap());
+                let second_file_clone = file_clone.unwrap();
+                self.files.insert(new_hash.clone(), second_file_clone.clone());
                 
                                
                 self.hashes.insert(_ino, new_hash.clone());
+                self.update_parent_hashes(&second_file_clone);
                 
                 
                 
@@ -472,6 +554,7 @@ impl Filesystem for Q1FS {
                         flags: 0,
                     },
                     file_name: "root".to_string(),
+                    parent_ino: 1,
                 },
                 data: Vec::new(),
             };

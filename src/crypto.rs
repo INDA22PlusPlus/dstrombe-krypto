@@ -1,9 +1,10 @@
 use crypto::{symmetriccipher::{Encryptor, Decryptor}, chacha20::ChaCha20, buffer::{RefReadBuffer, RefWriteBuffer, ReadBuffer, WriteBuffer}};
 use std::io::Read;
-use crate::fs::File;
+use crate::fs::{ File, XFileAttr };
 use crypto::sha2::Sha384;
 use crypto::digest::Digest;
 use crypto::buffer::BufferResult;
+
 pub fn encrypt_and_hash_file(file : &mut File, key : &Vec<u8>) -> String {
     let mut hasher_xattr = Sha384::new();
     let mut hasher_file = Sha384::new();
@@ -34,6 +35,23 @@ pub fn encrypt_and_hash_file(file : &mut File, key : &Vec<u8>) -> String {
 
     let mut node_hash = vec![0; node_hasher.output_bytes()];
     node_hasher.result_str()
+}
+
+pub fn hash_of_dir(attr : &XFileAttr, children : &Vec<String>, key : &Vec<u8>) -> String {
+    let mut hasher = Sha384::new();
+    let mut plaintext = serde_json::to_string(&attr).unwrap();
+    let mut buf = plaintext.as_bytes().to_vec().clone();
+    let mut ciphertext = encrypt(&mut buf, &key, &generate_nonce());
+    hasher.input(&ciphertext);
+
+    let mut children = children.clone();
+    children.sort();
+
+    for child in children {
+        hasher.input(child.as_bytes());
+    }
+    let mut hash = vec![0; hasher.output_bytes()];
+    hasher.result_str()
 }
 
 // FIXME implement

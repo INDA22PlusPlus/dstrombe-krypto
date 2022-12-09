@@ -14,7 +14,7 @@ pub struct Node {
     metadata: String,
     metadata_hash: String,
     data_hash: String,
-    //data : Option<String>,
+    data : Option<String>,
     parent_hash: String,
     is_dir: bool,
 }
@@ -25,6 +25,14 @@ struct InsertPayload<'r> {
     is_dir: bool,
     metadata: &'r str,
     parent_hash: &'r str,
+    data: Option<&'r str>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InsertResponse {
+    old_tree: Vec<Node>,
+    new_tree: Vec<Node>,
+    new_top_hash: String,
 }
 
 pub fn get_xattr(hash: &String, client : &mut Client, key : &Vec<u8>, server : &String) -> XFileAttr {
@@ -51,6 +59,7 @@ pub fn set_xattr(hash: &String, file : &mut File, client : &mut Client, key : &V
         is_dir: file.xattr.attr.kind == FileType::Directory,
         metadata: base64::encode(&encrypted).as_str(),
         parent_hash: "",
+        data : None,
     };
     let hash = encrypt_and_hash_file(file, &key);
     client.post(&url).body(encrypted).send().unwrap();
@@ -83,8 +92,6 @@ struct InsertProcedure {
     metadata : String, 
     r#type : String,
     parent_hash : String,
-    content_hash : String,
-    content_length : u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,30 +130,43 @@ pub fn mkdir(xfileattr : &XFileAttr, parent_hash : Option<String>, client : &mut
     response.read_to_end(&mut body).unwrap();
 }
 
-pub fn create(xfileattr : &XFileAttr, parent_hash : &String, client : &mut Client, key : &Vec<u8>, server : &String) {
+pub fn delete(hash: &String, client : &mut Client, server : &String) -> (Vec<Node>, Vec<Node>) {
+    let url = format!("{}/node/{}", server, hash);
+    let mut response = client.delete(&url).send().unwrap();
+    let mut body = Vec::new();
+    assert!(response.status().is_success());
+    response.read_to_end(&mut body).unwrap();
+    let response: InsertResponse = serde_json::from_slice(&body).unwrap();
+    (response.old_tree, response.new_tree)
+}
+
+pub fn create(file : &File, parent_hash : &String, client : &mut Client, key : &Vec<u8>, server : &String) -> (Vec<Node>, Vec<Node>) {
     //FIXME nonce
+    let xfileattr = file.xattr.clone();
+
     let url = format!("{}/node", server);
     let metadata = &base64::encode(&encrypt(&serde_json::to_vec(&xfileattr).unwrap(), &key, &vec![0;24]));
     println!("metadata: {}", metadata);
+    
+    let data : Option<String> = match &file.data.len() {
+        0 => None,
+        _ => Some(base64::encode(&encrypt(&file.data, &key, &vec![0;24]))),
+    };
+    
     let insert_procedure = InsertPayload {
         metadata: metadata,
         is_dir: false,
         parent_hash: &parent_hash.to_string(),
+        data : None,
     };
+
     let payload = serde_json::to_string(&insert_procedure).unwrap(); // FIXME nonce
     let mut response = client.post(&url).body(payload).send().unwrap();
     let mut body = Vec::new();
     assert!(response.status().is_success());
     response.read_to_end(&mut body).unwrap();
-}
-
-pub fn write_data(hash: &String, data : &Vec<u8>, client : &mut Client, key : &Vec<u8>, server : &String) {
-    // Write data to the provided file id'd by hash on the server
-    let url = format!("{}/api/data/{}", server, hash);
-    let encrypted = encrypt(&data, &key, &vec![0; 24]); // FIXME nonce
-    let mut response = client.post(&url).body(encrypted).send().unwrap();
-    let mut body = Vec::new();
-    response.read_to_end(&mut body).unwrap();
+    let insert_response : InsertResponse = serde_json::from_slice(&body).unwrap();
+    (insert_response.old_tree, insert_response.new_tree)
 }
 
 pub fn get_child_hashes(hash: &String, client : &Client, server : &String) -> Vec<String> { 
@@ -154,6 +174,7 @@ pub fn get_child_hashes(hash: &String, client : &Client, server : &String) -> Ve
     let mut response = client.get(&url).send().unwrap();
     let mut body = Vec::new();
     response.read_to_end(&mut body).unwrap();
+    println!("body: {}", String::from_utf8(body.clone()).unwrap());
     let hashes : Vec<String> = serde_json::from_slice(&body).unwrap();
     hashes
 }
